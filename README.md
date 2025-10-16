@@ -2,6 +2,8 @@ This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-
 
 ## Getting Started
 
+Enter interactive-shadower folder, run npm install, then npm run dev to view http://localhost:3000.
+
 First, run the development server:
 
 ```bash
