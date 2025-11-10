@@ -257,9 +257,58 @@ export default function FaceReactiveDots() {
         });
 
         selfieSegmentation.setOptions({
-          modelSelection: 1, // 0 for general (256x256), 1 for landscape (256x144) - faster and better for body
+          modelSelection: 1, // Back to landscape model for better body segmentation
           selfieMode: true,
         });
+
+        await selfieSegmentation.initialize();
+
+        // Function to process mask: erode to remove noise, then dilate to fill holes
+        const processMask = (imageData: ImageData): ImageData => {
+          const { data, width, height } = imageData;
+          const newData = new Uint8ClampedArray(data.length);
+
+          // Erosion: set pixel to 255 only if all 3x3 neighbors > 170
+          for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+              const idx = (y * width + x) * 4;
+              let allAbove = true;
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  const nidx = ((y + dy) * width + (x + dx)) * 4;
+                  if (data[nidx] <= 170) allAbove = false;
+                }
+              }
+              const val = allAbove ? 255 : 0;
+              newData[idx] = val;
+              newData[idx + 1] = val;
+              newData[idx + 2] = val;
+              newData[idx + 3] = 255;
+            }
+          }
+
+          // Dilation: set pixel to 255 if any 3x3 neighbor is > 128
+          const dilated = new Uint8ClampedArray(data.length);
+          for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+              const idx = (y * width + x) * 4;
+              let anyAbove = false;
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  const nidx = ((y + dy) * width + (x + dx)) * 4;
+                  if (newData[nidx] > 128) anyAbove = true;
+                }
+              }
+              const val = anyAbove ? 255 : 0;
+              dilated[idx] = val;
+              dilated[idx + 1] = val;
+              dilated[idx + 2] = val;
+              dilated[idx + 3] = 255;
+            }
+          }
+
+          return new ImageData(dilated, width, height);
+        };
 
         selfieSegmentation.onResults((results) => {
           if (!mounted) return;
@@ -273,8 +322,10 @@ export default function FaceReactiveDots() {
           segCanvas.width = results.segmentationMask.width;
           segCanvas.height = results.segmentationMask.height;
 
-          // Draw the segmentation mask
+          // Draw the segmentation mask with light blur to reduce noise
+          ctx.filter = 'blur(1px)';
           ctx.drawImage(results.segmentationMask, 0, 0);
+          ctx.filter = 'none';
           
           // Get the image data for dot rendering
           const imageData = ctx.getImageData(0, 0, segCanvas.width, segCanvas.height);
@@ -468,7 +519,7 @@ export default function FaceReactiveDots() {
             const idx = (my * segmentation.width + mx) * 4;
             // MediaPipe segmentation mask: check red channel (grayscale mask)
             const maskValue = segmentation.data[idx];
-            active = maskValue > 128; // Threshold for person detection
+            active = maskValue > 120; // Lower threshold for better detection
           }
         }
 
