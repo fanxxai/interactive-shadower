@@ -1,135 +1,82 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type {
-  SelfieSegmentation as SelfieSegmentationInstance,
-  SelfieSegmentationConfig,
-  Results as SelfieSegmentationResults,
-} from "@mediapipe/selfie_segmentation";
+import { useCallback, useEffect, useRef, useState, useMemo } from "react";
 import { CameraOff, Play, RefreshCw, Grid3X3, Ghost, Maximize2, Minimize2, Instagram, MessageCircle, FlipHorizontal2 } from "lucide-react";
+
+// Type definitions for MediaPipe
+interface SelfieSegmentationResults {
+  image: HTMLCanvasElement | HTMLImageElement | ImageBitmap;
+  segmentationMask: HTMLCanvasElement | HTMLImageElement | ImageBitmap;
+}
+
+interface SelfieSegmentationInstance {
+  close(): Promise<void>;
+  onResults(listener: (results: SelfieSegmentationResults) => void): void;
+  initialize(): Promise<void>;
+  reset(): void;
+  send(inputs: { image: HTMLVideoElement | HTMLImageElement | HTMLCanvasElement }): Promise<void>;
+  setOptions(options: { selfieMode?: boolean; modelSelection?: number }): void;
+}
+
+type SelfieSegmentationConstructor = new (config?: {
+  locateFile?: (path: string, prefix?: string) => string;
+}) => SelfieSegmentationInstance;
 
 // Define the available modes
 const MODES = {
   GREEN_DOTS: "GREEN_DOTS",
   IMAGE_REVEAL: "IMAGE_REVEAL",
   VIDEO_REVEAL: "VIDEO_REVEAL",
-};
+} as const;
+
+type Mode = typeof MODES[keyof typeof MODES];
 
 const DOT_MODES = [
   { id: "SMALL", label: "Dense Small Dots", spacing: 8, baseSize: 1 },
   { id: "MEDIUM", label: "Standard Dots", spacing: 12, baseSize: 2 },
   { id: "LARGE", label: "Bold Dense Dots", spacing: 16, baseSize: 2.7 },
-];
+] as const;
 
-type Dot = {
+interface Dot {
   x: number;
   y: number;
   baseX: number;
   baseY: number;
   size: number;
   baseSize: number;
-  active: boolean;
-};
-
-type VendorFullscreenDocument = Document & {
-  webkitFullscreenElement?: Element | null;
-  mozFullScreenElement?: Element | null;
-  msFullscreenElement?: Element | null;
-  webkitExitFullscreen?: () => Promise<void> | void;
-  mozCancelFullScreen?: () => Promise<void> | void;
-  msExitFullscreen?: () => Promise<void> | void;
-};
-
-type VendorFullscreenElement = HTMLElement & {
-  webkitRequestFullscreen?: () => Promise<void> | void;
-  mozRequestFullScreen?: () => Promise<void> | void;
-  msRequestFullscreen?: () => Promise<void> | void;
-};
-
-type SelfieSegmentationConstructor = new (config?: SelfieSegmentationConfig) => SelfieSegmentationInstance;
-
-function temporalSmooth(masks: Uint8Array[], length: number, voteRatio = 0.75) {
-  const out = new Uint8Array(length);
-  if (masks.length === 0) return out;
-  const needed = Math.ceil(masks.length * voteRatio);
-  for (let i = 0; i < length; i++) {
-    let s = 0;
-    for (let k = 0; k < masks.length; k++) s += masks[k][i];
-    out[i] = s >= needed ? 1 : 0;
-  }
-  return out;
+  active: number;
 }
 
-function dilate(src: Uint8Array, w: number, h: number, kernelSize: number = 1) {
-  const out = new Uint8Array(src.length);
-  const idx = (x: number, y: number) => y * w + x;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      const v = src[idx(x, y)];
-      if (v) {
-        for (let dy = -kernelSize; dy <= kernelSize; dy++) {
-          for (let dx = -kernelSize; dx <= kernelSize; dx++) {
-            const xx = x + dx;
-            const yy = y + dy;
-            if (xx >= 0 && yy >= 0 && xx < w && yy < h) out[idx(xx, yy)] = 1;
-          }
-        }
-      }
-    }
-  }
-  return out;
-}
-
-function erode(src: Uint8Array, w: number, h: number, kernelSize: number = 1) {
-  const out = new Uint8Array(src.length);
-  const idx = (x: number, y: number) => y * w + x;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      let allOnes = true;
-      for (let dy = -kernelSize; dy <= kernelSize && allOnes; dy++) {
-        for (let dx = -kernelSize; dx <= kernelSize && allOnes; dx++) {
-          const xx = x + dx;
-          const yy = y + dy;
-          if (xx < 0 || yy < 0 || xx >= w || yy >= h || src[idx(xx, yy)] === 0) allOnes = false;
-        }
-      }
-      out[idx(x, y)] = allOnes ? 1 : 0;
-    }
-  }
-  return out;
-}
-
-function morphologicalClose(src: Uint8Array, w: number, h: number, kernelSize: number = 1) {
-  return erode(dilate(src, w, h, kernelSize), w, h, kernelSize);
+interface MediaFile {
+  url: string;
+  name: string;
+  type: "image" | "video";
 }
 
 export default function FaceReactiveDots() {
   const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
-  const videoRef = useRef<HTMLVideoElement | null>(null); // front camera
-  const bgVideoRef = useRef<HTMLVideoElement | null>(null); // hidden background video player
-  const imageRef = useRef<HTMLImageElement | null>(null); // selected image
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+  const bgVideoRef = useRef<HTMLVideoElement | null>(null);
+  const imageRef = useRef<HTMLImageElement | null>(null);
   const imageCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const segmentationCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const animationRef = useRef<number | null>(null);
   const dotsRef = useRef<Dot[]>([]);
-  const lastSegmentationRef = useRef<{ width: number; height: number; data: Uint8Array } | null>(null);
+  const lastSegmentationRef = useRef<ImageData | null>(null);
   const frameCountRef = useRef(0);
   const lastFrameTimeRef = useRef<number>(performance.now());
-  const maskHistoryRef = useRef<Uint8Array[]>([]);
-  const smoothedMaskRef = useRef<Uint8Array | null>(null);
-  const segmentationTaskRef = useRef<SelfieSegmentationInstance | null>(null);
-  const segmentationMaskCanvasRef = useRef<HTMLCanvasElement | null>(null);
-  const isProcessingFrameRef = useRef<boolean>(false);
+  const selfieSegmentationRef = useRef<SelfieSegmentationInstance | null>(null);
 
   const [isActive, setIsActive] = useState(false);
   const [error, setError] = useState("");
-  const [isModelReady, setIsModelReady] = useState(false);
+  const [modelLoaded, setModelLoaded] = useState(false);
   const [bgVideoReady, setBgVideoReady] = useState(false);
   const [imageLoaded, setImageLoaded] = useState(false);
 
   // Media state
-  const [mode, setMode] = useState(MODES.GREEN_DOTS);
+  const [mode, setMode] = useState<Mode>(MODES.GREEN_DOTS);
   const currentMediaIndexRef = useRef<number>(-1);
   const [dotModeIndex, setDotModeIndex] = useState(1);
   const [ghostlyEnabled, setGhostlyEnabled] = useState(true);
@@ -139,13 +86,12 @@ export default function FaceReactiveDots() {
   const currentDotMode = useMemo(() => DOT_MODES[dotModeIndex], [dotModeIndex]);
 
   // Scan media directory for files
-  const scanMediaDirectory = useCallback(async () => {
+  const scanMediaDirectory = async (): Promise<MediaFile[]> => {
     try {
-      // Try to fetch directory listing using the File System API
       const response = await fetch('/api/scan-media');
       if (!response.ok) throw new Error('Failed to scan media directory');
       
-      const files = await response.json();
+      const files: string[] = await response.json();
       return files.map((file: string) => ({
         url: `/media/${file}`,
         name: file,
@@ -155,12 +101,9 @@ export default function FaceReactiveDots() {
       console.error('Error scanning media directory:', error);
       return [];
     }
-  }, []);
+  };
 
-  // --- Mode Cycling Function ---
-  // --- Mode Cycling Function ---
-
-  // initialize dot grid
+  // Initialize dot grid
   const initializeDots = useCallback(() => {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -179,7 +122,7 @@ export default function FaceReactiveDots() {
           baseY: y,
           size: currentDotMode.baseSize,
           baseSize: currentDotMode.baseSize,
-          active: false,
+          active: 0,
         });
       }
     }
@@ -209,7 +152,8 @@ export default function FaceReactiveDots() {
         setError("");
       }
     } catch (err) {
-      if (err instanceof DOMException && (err.name === "NotAllowedError" || err.name === "NotReadableError")) {
+      const error = err as Error;
+      if (error.name === "NotAllowedError" || error.name === "NotReadableError") {
         setError("Camera access denied or device busy. Check permissions.");
       } else {
         setError("Error starting camera.");
@@ -220,12 +164,10 @@ export default function FaceReactiveDots() {
   };
 
   const stopCamera = () => {
-    if (videoRef.current) {
-      const mediaStream = videoRef.current.srcObject as MediaStream | null;
-      if (mediaStream) {
-        mediaStream.getTracks().forEach((track) => track.stop());
-        videoRef.current.srcObject = null;
-      }
+    if (videoRef.current && videoRef.current.srcObject) {
+      const tracks = (videoRef.current.srcObject as MediaStream).getTracks();
+      tracks.forEach((t: MediaStreamTrack) => t.stop());
+      videoRef.current.srcObject = null;
     }
     setIsActive(false);
   };
@@ -274,7 +216,9 @@ export default function FaceReactiveDots() {
         try {
           bgVideoRef.current.pause();
           bgVideoRef.current.src = "";
-        } catch {}
+        } catch (e) {
+          console.error("Error stopping video:", e);
+        }
         setBgVideoReady(false);
       }
     } else {
@@ -293,9 +237,121 @@ export default function FaceReactiveDots() {
         if (bgVideoRef.current.readyState >= 3) onCan();
       }
     }
-  }, [scanMediaDirectory]);
+  }, []);
 
-  // 1. Initial Setup, Model Loading, and Background Asset Setup
+  // Initialize MediaPipe Selfie Segmentation
+  useEffect(() => {
+    let mounted = true;
+
+    const loadMediaPipe = async () => {
+      try {
+        // Dynamically import MediaPipe to avoid SSR issues
+        const { SelfieSegmentation } = await import('@mediapipe/selfie_segmentation');
+        
+        if (!mounted) return;
+
+        const selfieSegmentation = new (SelfieSegmentation as unknown as SelfieSegmentationConstructor)({
+          locateFile: (file) => {
+            return `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`;
+          }
+        });
+
+        selfieSegmentation.setOptions({
+          modelSelection: 1, // Back to landscape model for better body segmentation
+          selfieMode: true,
+        });
+
+        await selfieSegmentation.initialize();
+
+        // Function to process mask: erode to remove noise, then dilate to fill holes
+        const processMask = (imageData: ImageData): ImageData => {
+          const { data, width, height } = imageData;
+          const newData = new Uint8ClampedArray(data.length);
+
+          // Erosion: set pixel to 255 only if all 3x3 neighbors > 170
+          for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+              const idx = (y * width + x) * 4;
+              let allAbove = true;
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  const nidx = ((y + dy) * width + (x + dx)) * 4;
+                  if (data[nidx] <= 170) allAbove = false;
+                }
+              }
+              const val = allAbove ? 255 : 0;
+              newData[idx] = val;
+              newData[idx + 1] = val;
+              newData[idx + 2] = val;
+              newData[idx + 3] = 255;
+            }
+          }
+
+          // Dilation: set pixel to 255 if any 3x3 neighbor is > 128
+          const dilated = new Uint8ClampedArray(data.length);
+          for (let y = 1; y < height - 1; y++) {
+            for (let x = 1; x < width - 1; x++) {
+              const idx = (y * width + x) * 4;
+              let anyAbove = false;
+              for (let dy = -1; dy <= 1; dy++) {
+                for (let dx = -1; dx <= 1; dx++) {
+                  const nidx = ((y + dy) * width + (x + dx)) * 4;
+                  if (newData[nidx] > 128) anyAbove = true;
+                }
+              }
+              const val = anyAbove ? 255 : 0;
+              dilated[idx] = val;
+              dilated[idx + 1] = val;
+              dilated[idx + 2] = val;
+              dilated[idx + 3] = 255;
+            }
+          }
+
+          return new ImageData(dilated, width, height);
+        };
+
+        selfieSegmentation.onResults((results) => {
+          if (!mounted) return;
+          const segCanvas = segmentationCanvasRef.current;
+          if (!segCanvas || !results.segmentationMask) return;
+
+          const ctx = segCanvas.getContext('2d');
+          if (!ctx) return;
+
+          // Set canvas size to match video
+          segCanvas.width = results.segmentationMask.width;
+          segCanvas.height = results.segmentationMask.height;
+
+          // Draw the segmentation mask with light blur to reduce noise
+          ctx.filter = 'blur(1px)';
+          ctx.drawImage(results.segmentationMask, 0, 0);
+          ctx.filter = 'none';
+          
+          // Get the image data for dot rendering
+          const imageData = ctx.getImageData(0, 0, segCanvas.width, segCanvas.height);
+          lastSegmentationRef.current = imageData;
+        });
+
+        selfieSegmentationRef.current = selfieSegmentation;
+        setModelLoaded(true);
+      } catch (err) {
+        console.error("Failed to load MediaPipe:", err);
+        setError("Failed to load AI model. Please refresh the page.");
+      }
+    };
+
+    loadMediaPipe();
+
+    return () => {
+      mounted = false;
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+      if (selfieSegmentationRef.current) {
+        selfieSegmentationRef.current.close().catch(console.error);
+      }
+    };
+  }, []);
+
+  // Background video setup
   useEffect(() => {
     const videoEl = bgVideoRef.current;
     if (videoEl) {
@@ -310,123 +366,9 @@ export default function FaceReactiveDots() {
       return () => {
         videoEl.removeEventListener("playing", handlePlaying);
         videoEl.removeEventListener("pause", handlePause);
-        if (animationRef.current) cancelAnimationFrame(animationRef.current);
       };
     }
-
-    return () => {
-      if (animationRef.current) cancelAnimationFrame(animationRef.current);
-    };
   }, []);
-
-  useEffect(() => {
-    let cancelled = false;
-
-    (async () => {
-      try {
-        const mpModule = await import("@mediapipe/selfie_segmentation");
-        const SelfieSegmentationCtor = mpModule.SelfieSegmentation as SelfieSegmentationConstructor | undefined;
-        if (!SelfieSegmentationCtor) {
-          throw new Error("SelfieSegmentation constructor not available from module import");
-        }
-
-        const selfieSegmentation = new SelfieSegmentationCtor({
-          locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/selfie_segmentation/${file}`,
-        });
-
-        selfieSegmentation.setOptions({
-          modelSelection: 1,
-          selfieMode: true,
-        });
-
-        selfieSegmentation.onResults((results: SelfieSegmentationResults) => {
-          const maskBuffer = results.segmentationMask;
-          if (!maskBuffer) {
-            lastSegmentationRef.current = null;
-            smoothedMaskRef.current = null;
-            maskHistoryRef.current = [];
-            return;
-          }
-
-          let processingCanvas = segmentationMaskCanvasRef.current;
-          if (!processingCanvas) {
-            processingCanvas = document.createElement("canvas");
-            segmentationMaskCanvasRef.current = processingCanvas;
-          }
-
-          const width =
-            (maskBuffer as HTMLCanvasElement).width ??
-            (maskBuffer as HTMLImageElement).naturalWidth ??
-            (maskBuffer as HTMLImageElement).width ??
-            (maskBuffer as ImageBitmap).width ??
-            0;
-          const height =
-            (maskBuffer as HTMLCanvasElement).height ??
-            (maskBuffer as HTMLImageElement).naturalHeight ??
-            (maskBuffer as HTMLImageElement).height ??
-            (maskBuffer as ImageBitmap).height ??
-            0;
-
-          if (!width || !height) {
-            return;
-          }
-
-          processingCanvas.width = width;
-          processingCanvas.height = height;
-
-          const ctx = processingCanvas.getContext("2d");
-          if (!ctx) return;
-          ctx.clearRect(0, 0, width, height);
-          ctx.drawImage(maskBuffer as CanvasImageSource, 0, 0, width, height);
-          const maskImage = ctx.getImageData(0, 0, width, height);
-          const flatLen = width * height;
-          const raw = new Uint8Array(flatLen);
-          for (let i = 0; i < flatLen; i++) {
-            raw[i] = maskImage.data[i * 4] > 128 ? 1 : 0;
-          }
-
-          maskHistoryRef.current.push(raw);
-          if (maskHistoryRef.current.length > 4) maskHistoryRef.current.shift();
-          const voted = temporalSmooth(maskHistoryRef.current, flatLen, 0.75);
-          const closed = morphologicalClose(voted, width, height, 1);
-          smoothedMaskRef.current = closed;
-          lastSegmentationRef.current = { width, height, data: closed };
-        });
-
-        await selfieSegmentation.initialize();
-        if (cancelled) {
-          await selfieSegmentation.close();
-          return;
-        }
-        segmentationTaskRef.current = selfieSegmentation;
-        setIsModelReady(true);
-      } catch (e) {
-        console.error("model load error", e);
-        setError("Failed to load AI model");
-      }
-    })();
-    return () => {
-      cancelled = true;
-      setIsModelReady(false);
-      maskHistoryRef.current = [];
-      smoothedMaskRef.current = null;
-      lastSegmentationRef.current = null;
-      const currentTask = segmentationTaskRef.current;
-      segmentationTaskRef.current = null;
-      if (currentTask) {
-        currentTask.close().catch((closeErr) => {
-          console.error("Error closing segmentation task", closeErr);
-        });
-      }
-    };
-  }, []);
-
-  useEffect(() => {
-    const task = segmentationTaskRef.current;
-    if (task) {
-      task.setOptions({ selfieMode: isMirrored });
-    }
-  }, [isMirrored]);
 
   useEffect(() => {
     resizeCanvas();
@@ -465,22 +407,19 @@ export default function FaceReactiveDots() {
     };
   }, [isActive, cycleMode]);
 
-
-  // 2. Animation Loop (Dot Logic with MediaPipe Mask)
+  // Animation Loop
   useEffect(() => {
-    if (!isModelReady) return;
+    if (!modelLoaded) return;
+    
     const segmentVideo = async () => {
       const v = videoRef.current;
-      const selfie = segmentationTaskRef.current;
-      if (!v || v.readyState < v.HAVE_CURRENT_DATA || !selfie) return;
-      if (isProcessingFrameRef.current) return;
-      isProcessingFrameRef.current = true;
+      const selfieSegmentation = selfieSegmentationRef.current;
+      if (!v || !selfieSegmentation || v.readyState < v.HAVE_CURRENT_DATA) return;
+      
       try {
-        await selfie.send({ image: v });
+        await selfieSegmentation.send({ image: v });
       } catch (e) {
-        console.error("segment error", e);
-      } finally {
-        isProcessingFrameRef.current = false;
+        console.error("Segmentation error:", e);
       }
     };
 
@@ -497,7 +436,7 @@ export default function FaceReactiveDots() {
         segmentVideo();
       }
 
-      // clear / fade previous frame
+      // Clear or fade previous frame
       const nowTs = performance.now();
       const delta = nowTs - (lastFrameTimeRef.current || nowTs);
       lastFrameTimeRef.current = nowTs;
@@ -514,7 +453,7 @@ export default function FaceReactiveDots() {
         ctx.fillRect(0, 0, canvas.width, canvas.height);
       }
 
-      // prepare sampled background pixel data if needed
+      // Prepare sampled background pixel data if needed
       let data: Uint8ClampedArray | null = null;
       let bgSource: HTMLVideoElement | HTMLImageElement | null = null;
       if (mode === MODES.IMAGE_REVEAL && imageRef.current && imageLoaded) {
@@ -534,18 +473,8 @@ export default function FaceReactiveDots() {
         const ic = off.getContext("2d");
         if (ic) {
           ic.save();
-          const isVideoSource = bgSource instanceof HTMLVideoElement;
-          const isImageSource = bgSource instanceof HTMLImageElement;
-          const sourceWidth = isVideoSource
-            ? bgSource.videoWidth
-            : isImageSource
-            ? bgSource.naturalWidth || bgSource.width
-            : 0;
-          const sourceHeight = isVideoSource
-            ? bgSource.videoHeight
-            : isImageSource
-            ? bgSource.naturalHeight || bgSource.height
-            : 0;
+          const sourceWidth = ('videoWidth' in bgSource ? bgSource.videoWidth : bgSource.width) || 0;
+          const sourceHeight = ('videoHeight' in bgSource ? bgSource.videoHeight : bgSource.height) || 0;
 
           let drawWidth = canvas.width;
           let drawHeight = canvas.height;
@@ -575,25 +504,26 @@ export default function FaceReactiveDots() {
         }
       }
 
-      // segmentation data
+      // Segmentation data
       const segmentation = lastSegmentationRef.current;
-      const maskData = smoothedMaskRef.current || (segmentation && segmentation.data ? segmentation.data : null);
 
-      // draw dots
+      // Draw dots
       dotsRef.current.forEach((dot) => {
-        let isDotActive = false;
-        if (maskData && segmentation && segmentation.width && segmentation.height) {
+        let active = false;
+        if (segmentation) {
           const scaleX = segmentation.width / canvas.width;
           const scaleY = segmentation.height / canvas.height;
           const mx = Math.floor(dot.baseX * scaleX);
           const my = Math.floor(dot.baseY * scaleY);
           if (mx >= 0 && my >= 0 && mx < segmentation.width && my < segmentation.height) {
-            const idx = my * segmentation.width + mx;
-            if (maskData[idx] === 1) isDotActive = true;
+            const idx = (my * segmentation.width + mx) * 4;
+            // MediaPipe segmentation mask: check red channel (grayscale mask)
+            const maskValue = segmentation.data[idx];
+            active = maskValue > 120; // Lower threshold for better detection
           }
         }
 
-        dot.active = isDotActive;
+        dot.active = active ? 1 : 0;
         if (dot.active) {
           const size = dot.baseSize * 1.5;
           ctx.beginPath();
@@ -627,30 +557,27 @@ export default function FaceReactiveDots() {
     return () => {
       if (animationRef.current) cancelAnimationFrame(animationRef.current);
     };
-  }, [isActive, isModelReady, bgVideoReady, imageLoaded, mode, resizeCanvas, ghostlyEnabled, isMirrored]);
+  }, [isActive, modelLoaded, bgVideoReady, imageLoaded, mode, ghostlyEnabled, isMirrored]);
 
   useEffect(() => {
-    const fsDocument = document as VendorFullscreenDocument;
-    const listener: EventListener = () => {
-      const fsElement =
-        document.fullscreenElement ||
-        fsDocument.webkitFullscreenElement ||
-        fsDocument.mozFullScreenElement ||
-        fsDocument.msFullscreenElement;
+    const handleFullscreenChange = () => {
+      const fsElement = document.fullscreenElement ||
+        (document as Document & { webkitFullscreenElement?: Element }).webkitFullscreenElement ||
+        (document as Document & { mozFullScreenElement?: Element }).mozFullScreenElement ||
+        (document as Document & { msFullscreenElement?: Element }).msFullscreenElement;
       setIsFullscreen(Boolean(fsElement));
     };
 
-    const fullscreenEvents: string[] = [
-      "fullscreenchange",
-      "webkitfullscreenchange",
-      "mozfullscreenchange",
-      "MSFullscreenChange",
-    ];
-
-    fullscreenEvents.forEach((eventName) => document.addEventListener(eventName, listener));
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
+    document.addEventListener("mozfullscreenchange", handleFullscreenChange);
+    document.addEventListener("MSFullscreenChange", handleFullscreenChange);
 
     return () => {
-      fullscreenEvents.forEach((eventName) => document.removeEventListener(eventName, listener));
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("mozfullscreenchange", handleFullscreenChange);
+      document.removeEventListener("MSFullscreenChange", handleFullscreenChange);
     };
   }, []);
 
@@ -658,34 +585,27 @@ export default function FaceReactiveDots() {
     const container = containerRef.current;
     if (!container) return;
 
-    const element = container as VendorFullscreenElement;
-    const fsDocument = document as VendorFullscreenDocument;
-
     try {
-      const activeElement =
-        document.fullscreenElement ||
-        fsDocument.webkitFullscreenElement ||
-        fsDocument.mozFullScreenElement ||
-        fsDocument.msFullscreenElement;
-
-      if (!activeElement) {
-        if (element.requestFullscreen) {
-          await element.requestFullscreen();
-        } else if (element.webkitRequestFullscreen) {
-          await Promise.resolve(element.webkitRequestFullscreen());
-        } else if (element.mozRequestFullScreen) {
-          await Promise.resolve(element.mozRequestFullScreen());
-        } else if (element.msRequestFullscreen) {
-          await Promise.resolve(element.msRequestFullscreen());
+      if (!document.fullscreenElement) {
+        if (container.requestFullscreen) {
+          await container.requestFullscreen();
+        } else if ('webkitRequestFullscreen' in container) {
+          await (container as unknown as { webkitRequestFullscreen: () => Promise<void> }).webkitRequestFullscreen();
+        } else if ('mozRequestFullScreen' in container) {
+          await (container as unknown as { mozRequestFullScreen: () => Promise<void> }).mozRequestFullScreen();
+        } else if ('msRequestFullscreen' in container) {
+          await (container as unknown as { msRequestFullscreen: () => Promise<void> }).msRequestFullscreen();
         }
-      } else if (document.exitFullscreen) {
-        await document.exitFullscreen();
-      } else if (fsDocument.webkitExitFullscreen) {
-        await Promise.resolve(fsDocument.webkitExitFullscreen());
-      } else if (fsDocument.mozCancelFullScreen) {
-        await Promise.resolve(fsDocument.mozCancelFullScreen());
-      } else if (fsDocument.msExitFullscreen) {
-        await Promise.resolve(fsDocument.msExitFullscreen());
+      } else {
+        if (document.exitFullscreen) {
+          await document.exitFullscreen();
+        } else if ('webkitExitFullscreen' in document) {
+          await (document as unknown as { webkitExitFullscreen: () => Promise<void> }).webkitExitFullscreen();
+        } else if ('mozCancelFullScreen' in document) {
+          await (document as unknown as { mozCancelFullScreen: () => Promise<void> }).mozCancelFullScreen();
+        } else if ('msExitFullscreen' in document) {
+          await (document as unknown as { msExitFullscreen: () => Promise<void> }).msExitFullscreen();
+        }
       }
     } catch (err) {
       console.error("Fullscreen toggle failed", err);
@@ -732,7 +652,7 @@ export default function FaceReactiveDots() {
     };
   }, [isActive, cycleMode, cycleDotMode, toggleFullscreen]);
 
-  const isStartButtonDisabled = !isModelReady;
+  const isStartButtonDisabled = !modelLoaded;
 
   const subtleButtonClasses =
     "flex items-center justify-center gap-2 px-5 py-2.5 rounded-full bg-black text-white font-medium shadow-lg shadow-black/40 border border-transparent backdrop-blur transition hover:border-white/10";
@@ -745,10 +665,13 @@ export default function FaceReactiveDots() {
         style={{ transform: isMirrored ? "scaleX(-1)" : "none" }}
       />
 
-      {/* hidden bg video used when cycling to a video file */}
+      {/* Hidden segmentation canvas */}
+      <canvas ref={segmentationCanvasRef} className="hidden" />
+
+      {/* Hidden bg video used when cycling to a video file */}
       <video ref={bgVideoRef} className="hidden" playsInline muted loop />
 
-      {/* hidden camera input */}
+      {/* Hidden camera input */}
       <video
         ref={videoRef}
         className="hidden"
@@ -809,7 +732,7 @@ export default function FaceReactiveDots() {
                   disabled={isStartButtonDisabled}
                 >
                   <Play className="w-4 h-4" />
-                  {isModelReady ? "Start Experience" : "Loading Model..."}
+                  {modelLoaded ? "Start Experience" : "Loading AI Model..."}
                 </button>
               </div>
             </div>
@@ -873,7 +796,7 @@ export default function FaceReactiveDots() {
         </div>
       )}
 
-      {!isFullscreen && !isModelReady && (
+      {!isFullscreen && !modelLoaded && (
         <div className="absolute top-20 left-1/2 -translate-x-1/2 bg-yellow-500 text-white px-4 py-2 rounded animate-pulse">
           Initializing AI Model...
         </div>
